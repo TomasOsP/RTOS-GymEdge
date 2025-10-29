@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "../RTOS-GymEdge/RTOS-GymEdge"
+		},
+		{
+			"name": "GymEdge_AdquisitionData",
+			"path": "../RTOS-GymEdge/RTOS-GymEdge/Firmware/GymEdge_AdquisitionData"
+		}
+	],
+	"settings": {}
+}
