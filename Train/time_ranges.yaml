@@ -1,0 +1,12 @@
+trote:
+  trim: {start_seconds: 1.0, end_seconds: 1.0}
+escal:
+  trim: {start_seconds: 1.0, end_seconds: 1.0}
+bici:
+  trim: {start_seconds: 1.0, end_seconds: 1.0}
+elip:
+  trim: {start_seconds: 1.0, end_seconds: 1.0}
+lazo:
+  trim: {start_seconds: 1.0, end_seconds: 1.0}
+lazo2:
+  trim: {start_seconds: 1.0, end_seconds: 1.0}
