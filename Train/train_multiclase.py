@@ -13,37 +13,87 @@ from joblib import dump
 
 # ============= Señal =============
 def _norm_wn(cut, fs):
-    # normaliza y recorta a (0,1) para evitar ValueError en SciPy
     if fs is None or fs <= 0: fs = 50.0
     nyq = fs / 2.0
     wn = cut / nyq if nyq > 0 else 0.5
     return float(max(min(wn, 0.99), 1e-3))
 
 def butter_highpass(cut, fs, order=4):
-    wn = _norm_wn(cut, fs)
-    b, a = butter(order, wn, btype="highpass"); return b, a
+    b, a = butter(order, _norm_wn(cut, fs), btype="highpass"); return b, a
 
 def butter_lowpass(cut, fs, order=4):
-    wn = _norm_wn(cut, fs)
-    b, a = butter(order, wn, btype="lowpass");  return b, a
+    b, a = butter(order, _norm_wn(cut, fs),  btype="lowpass");  return b, a
 
 def psd_band_power(x, fs, flo, fhi):
     f, Pxx = welch(x, fs=fs, nperseg=min(256, len(x)))
     m = (f>=flo) & (f<=fhi)
     return float(trapezoid(Pxx[m], f[m]) if m.any() else 0.0)
 
-# ============= Carga CSV =============
-def read_accel_csv(path):
-    df = pd.read_csv(path)
-    c = list(df.columns)
-    df = df.rename(columns={c[0]:"t", c[1]:"ax", c[2]:"ay", c[3]:"az"})
-    return df[["t","ax","ay","az"]]
+# ============= Utils tiempo/unidades =============
+G = 9.80665
+RAD = np.pi/180.0
 
-def read_gyro_csv(path):
+def _detect_time_scale(colname, v):
+    name = colname.lower()
+    med = np.median(v)
+    if "us" in name:      return 1e-6   # microseg → s
+    if "ms" in name:      return 1e-3   # miliseg → s
+    if "ns" in name:      return 1e-9
+    # heurística por magnitud
+    if med > 1e12:        return 1e-9   # ns
+    if med > 1e9:         return 1e-6   # µs (epoch en µs)
+    if med > 1e6:         return 1e-6   # µs
+    if med > 1e3:         return 1e-3   # ms
+    return 1.0            # ya en segundos
+
+# ============= Carga CSV (formato nuevo) =============
+def read_imu_csv(path):
+    """
+    Espera columnas: timestamp_*, ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps
+    Devuelve: t(s), ax/ay/az (m/s^2), gx/gy/gz (rad/s)
+    """
     df = pd.read_csv(path)
-    c = list(df.columns)
-    df = df.rename(columns={c[0]:"t", c[1]:"gx", c[2]:"gy", c[3]:"gz"})
-    return df[["t","gx","gy","gz"]]
+    cols = [c.strip() for c in df.columns]
+    df.columns = cols
+
+    # localizar timestamp
+    tcol = None
+    for c in cols:
+        if c.lower().startswith("timestamp"):
+            tcol = c; break
+    if tcol is None:
+        raise ValueError(f"{path}: no encuentro columna de tiempo que empiece por 'timestamp'.")
+
+    # convertir tiempo a segundos relativos (t0=0)
+    scale = _detect_time_scale(tcol, pd.to_numeric(df[tcol], errors="coerce").values)
+    t = pd.to_numeric(df[tcol], errors="coerce").values * scale
+    t = t - np.nanmin(t)
+
+    # mapear columnas físicas con tolerancia de nombre
+    def pick(key):
+        # busca coincidencia exacta; si no, por contiene
+        for c in cols:
+            if c.lower() == key: return c
+        for c in cols:
+            if key in c.lower(): return c
+        return None
+
+    axc, ayc, azc = pick("ax_g"), pick("ay_g"), pick("az_g")
+    gxc, gyc, gzc = pick("gx_dps"), pick("gy_dps"), pick("gz_dps")
+    need = [axc, ayc, azc, gxc, gyc, gzc]
+    if any(c is None for c in need):
+        raise ValueError(f"{path}: faltan columnas esperadas (ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps).")
+
+    ax = pd.to_numeric(df[axc], errors="coerce").values * G
+    ay = pd.to_numeric(df[ayc], errors="coerce").values * G
+    az = pd.to_numeric(df[azc], errors="coerce").values * G
+    gx = pd.to_numeric(df[gxc], errors="coerce").values * RAD
+    gy = pd.to_numeric(df[gyc], errors="coerce").values * RAD
+    gz = pd.to_numeric(df[gzc], errors="coerce").values * RAD
+
+    out = pd.DataFrame({"t": t, "ax": ax, "ay": ay, "az": az, "gx": gx, "gy": gy, "gz": gz})
+    out = out.dropna().sort_values("t").drop_duplicates(subset=["t"]).reset_index(drop=True)
+    return out
 
 # ============= Recorte =============
 def crop_df_by_intervals(df, intervals):
@@ -59,14 +109,17 @@ def trim_df(df, start_seconds=0.0, end_seconds=0.0):
     return df[(df["t"]>=tmin+start_seconds)&(df["t"]<=tmax-end_seconds)].reset_index(drop=True)
 
 def base_activity(name):
-    # quita sufijo numérico: trote2 -> trote; escal3 -> escal
-    return re.sub(r"\d+$","", name.lower())
+    # Datos_Trote2.csv -> trote
+    name = os.path.splitext(os.path.basename(name))[0]
+    name = re.sub(r'^datos[_-]*','', name, flags=re.IGNORECASE)
+    name = re.sub(r'\d+$','', name.lower())
+    return name
 
-def apply_time_config(activity, df, cfg):
+def apply_time_config(activity_key, df, cfg):
     if cfg is None: return df
-    sec = cfg.get(activity, None)
+    sec = cfg.get(activity_key, None)
     if sec is None:
-        sec = cfg.get(base_activity(activity), None)
+        sec = cfg.get(base_activity(activity_key), None)
         if sec is None: return df
     if "intervals" in sec: df = crop_df_by_intervals(df, sec["intervals"])
     if "trim" in sec:
@@ -74,16 +127,6 @@ def apply_time_config(activity, df, cfg):
         en = float(sec["trim"].get("end_seconds", 0.0))
         df = trim_df(df, st, en)
     return df
-
-# ============= Alineación =============
-def align_accel_gyro(accel_df, gyro_df, round_decimals=3, tolerance_s=0.002):
-    a, g = accel_df.copy(), gyro_df.copy()
-    a["t_r"]=a["t"].round(round_decimals); g["t_r"]=g["t"].round(round_decimals)
-    a=a.sort_values("t_r"); g=g.sort_values("t_r")
-    df = pd.merge_asof(a, g, on="t_r", direction="nearest", tolerance=tolerance_s).dropna().reset_index(drop=True)
-    if "t_x" in df.columns: df=df.rename(columns={"t_x":"t"})
-    elif "t" not in df.columns: df["t"]=df["t_r"]
-    return df[["t","ax","ay","az","gx","gy","gz"]]
 
 # ============= Prepro =============
 def preprocess_df(df, fs, hp_cut=0.25, lp_cut=20.0):
@@ -124,10 +167,9 @@ class WindowingCfg:
 def estimate_fs(t):
     t = np.asarray(t)
     if t.size < 2: return 50.0
-    dt = np.diff(t)
-    dt = dt[np.isfinite(dt)]
+    dt = np.diff(t); dt = dt[np.isfinite(dt)]
     if dt.size == 0: return 50.0
-    m = np.median(dt)  # mediana → robusto a huecos/outliers
+    m = np.median(dt)
     return (1.0/m) if m > 0 else 50.0
 
 def segment_indices(n, win, hop):
@@ -160,16 +202,22 @@ def windows_from_df(df, label, cfg: WindowingCfg):
         y_list.append(label)
     return (np.vstack(X_list) if X_list else np.empty((0,))), np.array(y_list), fs, win, hop
 
-# ============= Pareo de archivos =============
-def find_pairs(data_dir):
-    accel_files = glob.glob(os.path.join(data_dir, "*_acel_*.csv"))
-    pairs=[]
-    for a in accel_files:
-        base = os.path.basename(a)
-        activity = base.split("_acel_")[0]  # p.ej. "trote", "escal", "bici", "elip"
-        g = glob.glob(os.path.join(data_dir, f"{activity}_giros_*.csv"))
-        if g: pairs.append((activity, a, g[0]))
-    return pairs
+# ============= Descubrir archivos (formato nuevo) =============
+def find_activity_files(data_dir):
+    pats = glob.glob(os.path.join(data_dir, "Datos_*.csv"))  # <-- deja solo uno
+    # pats += glob.glob(os.path.join(data_dir, "datos_*.csv"))  # quítalo
+
+    files = []
+    seen = set()
+    for p in pats:
+        key = os.path.normcase(os.path.abspath(p))  # dedupe robusto en Windows
+        if key in seen: 
+            continue
+        seen.add(key)
+        act = base_activity(os.path.basename(p))  # p.ej. Datos_Trote2.csv → 'trote'
+        files.append((act, p))
+    return files
+
 
 # ============= Main =============
 def main(args):
@@ -181,12 +229,13 @@ def main(args):
     else:
         print("Sin config de tiempo (usar archivos completos).")
 
-    pairs = find_pairs(args.data_dir)
-    if not pairs: raise SystemExit(f"No se encontraron pares *_acel_*.csv + *_giros_*.csv en {args.data_dir}")
+    files = find_activity_files(args.data_dir)
+    if not files:
+        raise SystemExit(f"No encontré CSV en formato 'Datos_*.csv' dentro de {args.data_dir}")
 
-    # Descubrir nombres base de actividades (sin dígitos) y fijar orden estable
-    activities = sorted({base_activity(p[0]) for p in pairs})
-    preferred = ["trote","escal","bici","elip","lazo","plancha"]  # añadí lazo aquí por si acaso
+    # Clases detectadas y orden
+    activities = sorted({act for act,_ in files})
+    preferred = ["trote","escal","bici","elip","lazo","plancha"]
     activities = sorted(set(activities), key=lambda x: (preferred.index(x) if x in preferred else 999, x))
     name2id = {name:i for i,name in enumerate(activities)}
     print("Clases:", name2id)
@@ -194,35 +243,22 @@ def main(args):
     X_all, y_all = [], []
     any_fs=any_win=any_hop=None
 
-    for activity, acel_path, giros_path in pairs:
-        base = base_activity(activity)
-        if base not in name2id:
-            print(f"[AVISO] '{base}' no mapeada → omitido."); continue
+    for act, path in files:
+        # Carga (ya trae acel+gyro)
+        df = read_imu_csv(path)
 
-        # Carga
-        a_raw = read_accel_csv(acel_path)
-        g_raw = read_gyro_csv(giros_path)
+        # Recorte por config (clave por actividad)
+        df = apply_time_config(act, df, cfg)
 
-        # Recorte
-        a_cut = apply_time_config(activity, a_raw, cfg)
-        g_cut = apply_time_config(activity, g_raw, cfg)
-        if a_cut.empty or g_cut.empty:
-            print(f"[AVISO] {activity}: recorte dejó vacío → omitido."); continue
-
-        # Alineación
-        df = align_accel_gyro(a_cut, g_cut, round_decimals=args.round_decimals, tolerance_s=args.tolerance_s)
         if df.empty:
-            print(f"[AVISO] {activity}: sin muestras alineadas → omitido."); continue
+            print(f"[AVISO] {act}: sin datos tras recorte → omitido."); continue
 
-        # Ordenar/limpiar y estimar fs
-        df = df.sort_values("t").drop_duplicates(subset=["t"]).reset_index(drop=True)
+        # Preprocesado
         fs = estimate_fs(df["t"].values)
-
-        # Prepro (con filtros robustos)
-        # print(f"   [{activity}] fs≈{fs:.1f} Hz, lp_cut={args.lp_cut} Hz, Wn={_norm_wn(args.lp_cut, fs):.2f}")  # depuración opcional
+        # print(f"   [{act}] fs≈{fs:.1f} Hz")  # depuración opcional
         df = preprocess_df(df, fs, hp_cut=args.hp_cut, lp_cut=args.lp_cut)
 
-        # --- Recorte automático opcional ---
+        # Auto-trim opcional
         if args.auto_trim:
             pre_len = len(df)
             df = auto_trim_by_stability(
@@ -233,18 +269,18 @@ def main(args):
                 thr_a_std=args.auto_thr_a_std
             )
             post_len = len(df)
-            print(f"   auto_trim: {activity} => {pre_len}→{post_len} muestras")
+            print(f"   auto_trim: {act} => {pre_len}→{post_len} muestras")
 
-        # Ventaneo + label multiclase
-        label = name2id[base]
+        # Ventanas + label
+        label = name2id[act]
         cfg_w = WindowingCfg(win_sec=args.win_sec, hop_frac=args.hop_frac)
         X, y, fs_used, win, hop = windows_from_df(df, label, cfg_w)
         if X.size==0:
-            print(f"[AVISO] {activity}: insuficiente para {args.win_sec}s → omitido."); continue
+            print(f"[AVISO] {act}: insuficiente para {args.win_sec}s → omitido."); continue
 
         X_all.append(X); y_all.append(y)
         any_fs, any_win, any_hop = fs_used, win, hop
-        print(f"{activity:>8}: ventanas={len(y)}  clase={label} ({base})")
+        print(f"{act:>8}: ventanas={len(y)}  clase={label}")
 
     if not X_all: raise SystemExit("No se generaron ventanas. Revisa recortes/ventanas.")
 
@@ -281,31 +317,23 @@ def main(args):
     print(f"\nModelo guardado en: {args.out_model}")
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="Entrenar multiclase (trote, escaleras, bici, elíptica, ...).")
-    p.add_argument("--data_dir", type=str, default="data")
-    p.add_argument("--time_cfg", type=str, default="time_ranges.yaml")
+    p = argparse.ArgumentParser(description="Entrenar multiclase desde CSV únicos (Datos_*.csv).")
+    p.add_argument("--data_dir", type=str, default="DATA_IMU")
+    p.add_argument("--time_cfg", type=str, default=None)
     p.add_argument("--win_sec", type=float, default=2.0)
     p.add_argument("--hop_frac", type=float, default=0.5)
     p.add_argument("--hp_cut", type=float, default=0.25)
     p.add_argument("--lp_cut", type=float, default=20.0)
-    p.add_argument("--round_decimals", type=int, default=3)
-    p.add_argument("--tolerance_s", type=float, default=0.002)
     p.add_argument("--n_estimators", type=int, default=300)
     p.add_argument("--test_size", type=float, default=0.25)
     p.add_argument("--out_model", type=str, default="modelo_multiclase.joblib")
 
     # ---- Flags para auto-trim ----
     p.add_argument("--auto_trim", action="store_true",
-                   help="Activa recorte automático por estabilidad (g_rms y a_std).")
-    p.add_argument("--auto_win_sec", type=float, default=1.0,
-                   help="Tamaño de ventana deslizante para medir estabilidad (s).")
-    p.add_argument("--auto_hold_sec", type=float, default=3.0,
-                   help="Duración mínima estable para aceptar tramo (s).")
-    p.add_argument("--auto_thr_g_rms", type=float, default=0.4,
-                   help="Umbral de RMS de g_mag (rad/s) para considerar movimiento estable.")
-    p.add_argument("--auto_thr_a_std", type=float, default=0.6,
-                   help="Umbral de STD de a_mag (m/s^2) para considerar movimiento estable.")
+                   help="Recorte automático por estabilidad (g_rms y a_std).")
+    p.add_argument("--auto_win_sec", type=float, default=1.0)
+    p.add_argument("--auto_hold_sec", type=float, default=3.0)
+    p.add_argument("--auto_thr_g_rms", type=float, default=0.4)
+    p.add_argument("--auto_thr_a_std", type=float, default=0.6)
     args = p.parse_args()
     main(args)
-
-# python train_multiclase.py --data_dir data --time_cfg time_ranges.yaml --auto_trim
