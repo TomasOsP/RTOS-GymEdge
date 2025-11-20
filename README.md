@@ -12,8 +12,3 @@ The purpose of the project is to measure the intensity and duration of different
 
 ## Project structure
 The project mainly manages two folders. Each one is based on the task or objective to be accomplished:
-
-├── firmware/ # Hardware on ESP32
-    └── GymEdge_AdquisitionData/ # Main Arduino project
-├── Python/ # Data read and implemented model
-└── README.md # This file
