@@ -1,7 +1,6 @@
-# gym_live_dashboard.py
-# Versión optimizada y corregida del sistema de recepción BLE + gráficas + inferencia
-# Diseñado para macOS (usa Bleak + asyncio en hilo separado).
-# Controles (en la terminal): 's' = start/resume, 'q' = pause, 'd' = toggle diagnóstico Top-3, 'x' = salir
+# gym_live_dashboard_web.py
+# Servidor web + BLE + inferencia en tiempo real
+# Servido en http://0.0.0.0:8000 (puerto elegido: 8000)
 
 import time
 import threading
@@ -10,31 +9,39 @@ from pathlib import Path
 from collections import deque
 from threading import Lock
 from datetime import datetime
+import json
+import sys
+from scipy.fft import rfft, rfftfreq
+from scipy.signal import find_peaks
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
 from joblib import load
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+import uvicorn
 
 from bleak import BleakScanner, BleakClient
 
-# Opcionales para DSP (si no las necesitas, el código sigue funcionando sin crash)
+# DSP
 from scipy.signal import butter, filtfilt, welch, lfilter
 from scipy.integrate import trapezoid
 
-# ===================== CONFIG =====================
+# ================= Configuration =================
+HOST = "0.0.0.0"
+PORT = 8000
+
 BLE_DEVICE_NAME = "ESP32-MPU-Mac"
 TX_CHAR_UUID = "abcdef12-3456-7890-abcd-ef1234567890"
 MODEL_PATH = Path(__file__).with_name("modelo_multiclase.joblib")
 
-WINDOW_SEC = 10             # ventana visible en gráfica (segundos)
+WINDOW_SEC = 10
 SAMPLE_HZ_GUESS = 50.0
-SAMPLE_HZ = 50.0           # valor por defecto si no se puede estimar
-MODEL_MIN_SAMPLES_SEC = 1.5
+SAMPLE_HZ = 50.0
+MAX_POINTS = int(60 * SAMPLE_HZ)
 
-# Buffers
-MAX_POINTS = int(60 * SAMPLE_HZ)  # almacena hasta 60s por defecto
+# Buffers and locks
 buf_lock = Lock()
 t_buf   = deque(maxlen=MAX_POINTS)
 ax_buf  = deque(maxlen=MAX_POINTS)
@@ -44,39 +51,36 @@ gx_buf  = deque(maxlen=MAX_POINTS)
 gy_buf  = deque(maxlen=MAX_POINTS)
 gz_buf  = deque(maxlen=MAX_POINTS)
 
-# RX text buffer (paquetes terminados con ';')
 rx_text_buffer = ""
 rx_lock = Lock()
 
-# Estado
+# States
 is_logging = False
-plotting_active = False
 program_exit = False
-start_plot_event = threading.Event()
-
-diag_active = False
-diag_thread = None
-
 t0_millis = None
 
 # CSV
 csv_file = None
 csv_writer = None
-csv_path = None
 
-# Modelo
+# Model
 model_pipe = None
 label_names = None
 model_win_sec = 2.0
 model_hop_frac = 0.5
 
-# Constantes
+# Constants
 G = 9.80665
 RAD = np.pi / 180.0
-
 HEADERS = ["timestamp_ms","ax_g","ay_g","az_g","gx_dps","gy_dps","gz_dps"]
 
-# ===================== UTILIDADES DSP / FEATURES =====================
+# FastAPI app
+app = FastAPI()
+# connected websockets
+ws_connections = set()
+ws_lock = asyncio.Lock()
+
+# ================= DSP / features (same as your code) ================
 def _norm_wn(cut, fs):
     if fs is None or fs <= 0:
         fs = SAMPLE_HZ_GUESS
@@ -100,7 +104,6 @@ def filtfilt_safe(b, a, x):
         return x.copy()
     padlen = 3 * (max(len(a), len(b)) - 1)
     if x.size <= padlen:
-        # lfilter es más seguro si no hay suficiente longitud
         return lfilter(b, a, x)
     return filtfilt(b, a, x)
 
@@ -124,7 +127,6 @@ def preprocess_df(df, fs, hp_cut=0.25, lp_cut=20.0):
         for c in ["gx","gy","gz"]:
             df[c] = filtfilt_safe(b2, a2, df[c].values)
     except Exception:
-        # si falla filtfilt, devolver datos sin filtrar
         pass
     df["a_mag"] = np.sqrt(df["ax"]**2 + df["ay"]**2 + df["az"]**2)
     df["g_mag"] = np.sqrt(df["gx"]**2 + df["gy"]**2 + df["gz"]**2)
@@ -158,14 +160,11 @@ def extract_features(seg, fs):
     ]
     return np.array(feats, dtype=float)
 
-# ===================== PREDICCIÓN Top-K =====================
+# ================= Prediction Top-K =================
 def predict_topk_now(k_top=3):
-    """Toma la última ventana del buffer y devuelve Top-k (label, prob)."""
     global model_pipe, label_names, model_win_sec
-
     if model_pipe is None or label_names is None:
-        return None, None, "⚠️  Modelo no cargado."
-
+        return None, None, "Modelo no cargado."
     with buf_lock:
         t_vals  = np.array(t_buf, dtype=float)
         ax_vals = np.array(ax_buf, dtype=float)
@@ -174,15 +173,12 @@ def predict_topk_now(k_top=3):
         gx_vals = np.array(gx_buf, dtype=float)
         gy_vals = np.array(gy_buf, dtype=float)
         gz_vals = np.array(gz_buf, dtype=float)
-
     if t_vals.size < 3:
-        return None, None, "⚠️  Muy pocos datos en buffer para predecir."
-
+        return None, None, "Muy pocos datos en buffer."
     fs = estimate_fs(t_vals)
     win = int(max(1, round(model_win_sec * fs)))
     if t_vals.size < win:
-        return None, None, f"⚠️  Aún no hay muestras suficientes para {model_win_sec:.1f}s (win={win}, fs≈{fs:.1f}Hz)."
-
+        return None, None, f"No hay muestras suficientes para {model_win_sec:.1f}s (win={win})."
     i1 = t_vals.size
     i0 = i1 - win
     seg = pd.DataFrame({
@@ -194,65 +190,40 @@ def predict_topk_now(k_top=3):
         "gy": gy_vals[i0:i1],
         "gz": gz_vals[i0:i1],
     })
-
     seg = preprocess_df(seg, fs)
     X = extract_features(seg, fs).reshape(1, -1)
-
     try:
         proba = model_pipe.predict_proba(X)[0]
     except Exception as e:
-        return None, None, f"⚠️ Error en predict_proba: {e}"
-
+        return None, None, f"predict_proba error: {e}"
     idxs = np.argsort(proba)[::-1][:k_top]
     top = [(label_names[int(i)], float(proba[int(i)])) for i in idxs]
     t0 = float(seg["t"].iloc[0])
     return t0, top, None
 
-# Diagnóstico contínuo
-def diag_loop():
-    print("🟡 Diagnóstico continuo: Top-3 cada 1s (sal con 'x').")
-    global diag_active
-    while diag_active and not program_exit:
-        t0, top, err = predict_topk_now(k_top=3)
-        if err:
-            print(err)
-        else:
-            pretty = " | ".join([f"{i+1}) {lbl} {prob:.2f}" for i,(lbl,prob) in enumerate(top)])
-            print(f"[{t0:7.2f}s] {pretty}")
-        time.sleep(1.0)
-    print("🔵 Diagnóstico continuo detenido.")
-
-# ===================== RX / PARSING =====================
+# ================= RX Parsing =================
 def process_records(text_chunk: str):
-    """Acumula texto de notificaciones, separa por ';', parsea y actualiza buffers/CSV."""
     global rx_text_buffer, t0_millis, csv_writer, is_logging
-
     with rx_lock:
         rx_text_buffer += text_chunk
         parts = rx_text_buffer.split(';')
-        rx_text_buffer = parts[-1]  # última parte posible incompleta
-
+        rx_text_buffer = parts[-1]
     for rec in parts[:-1]:
         rec = rec.strip().replace('\r','').replace('\n','')
-        if not rec:
-            continue
+        if not rec: continue
         cols = rec.split(',')
         if len(cols) != 7:
             continue
-
-        # escribir CSV si está activo
         try:
             if is_logging and csv_writer:
                 csv_writer.writerow(cols)
                 csv_file.flush()
         except Exception:
             pass
-
         try:
             ts_ms = int(cols[0])
             ax_g = float(cols[1]); ay_g = float(cols[2]); az_g = float(cols[3])
             gx_d = float(cols[4]); gy_d = float(cols[5]); gz_d = float(cols[6])
-
             ax = ax_g * G
             ay = ay_g * G
             az = az_g * G
@@ -261,49 +232,41 @@ def process_records(text_chunk: str):
             gz = gz_d * RAD
         except Exception:
             continue
-
         if t0_millis is None:
             t0_millis = ts_ms
         t_rel = (ts_ms - t0_millis) / 1000.0
-
         with buf_lock:
             t_buf.append(t_rel)
             ax_buf.append(ax); ay_buf.append(ay); az_buf.append(az)
             gx_buf.append(gx); gy_buf.append(gy); gz_buf.append(gz)
 
-# ===================== BLE =====================
+# ================= BLE =================
 async def ble_main():
-    """Busca por nombre y se suscribe a NOTIFY (Bleak)."""
-    print("🔎 Buscando periféricos BLE… (timeout 5s)")
+    print("BLE: buscando periféricos (5s)...")
     try:
         devices = await BleakScanner.discover(timeout=5.0)
     except Exception as e:
-        print(f"❌ Error en discovery BLE: {e}")
+        print("BLE discovery error:", e)
         return
-
     device = next((d for d in devices if d.name == BLE_DEVICE_NAME), None)
     if device is None:
-        print(f"❌ No se encontró '{BLE_DEVICE_NAME}'. Asegúrate de que esté anunciando.")
+        print(f"BLE: no se encontró {BLE_DEVICE_NAME}")
         return
-
-    print(f"📶 Conectando a {device.name} ({device.address})…")
+    print(f"BLE: conectando a {device.name} ({device.address})")
     try:
         async with BleakClient(device) as client:
             if not client.is_connected:
-                print("❌ No se pudo conectar.")
+                print("BLE: no conectado")
                 return
-            print("✅ Conectado. Suscribiéndose a NOTIFY…")
-
+            print("BLE: conectado, suscribiendo notify...")
             def handle_notify(_, data: bytearray):
                 try:
                     chunk = data.decode("utf-8", errors="ignore")
                 except Exception:
                     return
                 process_records(chunk)
-
             await client.start_notify(TX_CHAR_UUID, handle_notify)
-            print("🟢 Suscrito. Pulsa 's' para graficar. 'd' inicia Top-3 continuo. 'x' para salir.")
-            # Mantener conexión hasta que se pida salir
+            print("BLE: suscrito. Enviando datos al dashboard...")
             while not program_exit:
                 await asyncio.sleep(0.2)
             try:
@@ -311,77 +274,221 @@ async def ble_main():
             except Exception:
                 pass
     except Exception as e:
-        print(f"❌ Error en conexión BLE: {e}")
+        print("BLE connection error:", e)
+    print("BLE: terminado")
 
-    print("🔌 BLE: desconectado / terminado.")
+# ============== FastAPI: pages & ws ===================
+INDEX_HTML = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>GymEdge Dashboard</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial; margin: 12px; background:#f7f7f8; }
+    .row { display:flex; gap:12px; }
+    .card { background:white; padding:12px; border-radius:8px; box-shadow:0 2px 6px rgba(0,0,0,0.08); flex:1; }
+    canvas { width:100%; height:240px; }
+    h2 { margin:6px 0 10px 0; font-size:18px; }
+    .pred { font-size:18px; font-weight:600; }
+    .topk { margin-top:8px; font-size:14px; }
+  </style>
+</head>
+<body>
+  <h1>GymEdge Live Dashboard</h1>
+  <div class="row">
+    <div class="card" style="flex:2">
+      <h2>Acelerómetro</h2>
+      <canvas id="accChart"></canvas>
+    </div>
+    <div class="card" style="flex:2">
+      <h2>Giroscopio</h2>
+      <canvas id="gyroChart"></canvas>
+    </div>
+    <div class="card" style="flex:1">
+      <h2>Predicción</h2>
+      <div id="pred" class="pred">Esperando datos...</div>
+      <div id="topk" class="topk"></div>
+      <hr/>
+      <div id="info"></div>
+    </div>
+  </div>
 
-# ===================== GRAFICADO (FuncAnimation) =====================
-fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 7))
-fig.suptitle("GymEdge Live Monitor", fontsize=16, fontweight="bold")
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script>
+    const ws = new WebSocket("ws://" + location.host + "/ws");
+    const maxPoints = 200;
 
-line_ax, = ax1.plot([], [], lw=1.2, label="ax")
-line_ay, = ax1.plot([], [], lw=1.2, label="ay")
-line_az, = ax1.plot([], [], lw=1.2, label="az")
-ax1.set_ylabel("Aceleración (m/s²)")
-ax1.set_ylim(-30, 30)
-ax1.legend(); ax1.grid(True, alpha=0.3)
+    function makeChart(ctx, labels, colors) {
+      return new Chart(ctx, {
+        type: 'line',
+        data: { datasets: labels.map((lab, i) => ({
+            label: lab,
+            data: [],
+            borderColor: colors[i],
+            fill: false,
+            tension: 0.1,
+            pointRadius: 0
+        })) },
+        options: {
+          animation: false,
+          parsing: false,
+          normalized: true,
+          scales: {
+            x: { type: 'linear', title: {display:true, text:'t (s)'}},
+            y: { title: {display:true, text: 'valor'}}
+          }
+        }
+      });
+    }
 
-pred_text = ax2.text(0.02, 0.6, "Esperando datos...", fontsize=20, fontweight="bold", transform=ax2.transAxes, color="gray")
-conf_text = ax2.text(0.02, 0.35, "", fontsize=14, transform=ax2.transAxes, color="black")
-ax2.axis("off")
+    const accChart = makeChart(document.getElementById('accChart').getContext('2d'),
+      ['ax','ay','az','|a|'], ['#1f77b4','#ff7f0e','#2ca02c','#000000']);
 
-def get_current_prediction_simple():
-    """Versión simple: usa predict_topk_now y devuelve etiqueta y confianza."""
-    t0, top, err = predict_topk_now(k_top=1)
-    if err:
-        return None, 0.0, err
-    if not top:
-        return None, 0.0, "Sin top"
-    lbl, prob = top[0]
-    return lbl, prob, None
+    const gyroChart = makeChart(document.getElementById('gyroChart').getContext('2d'),
+      ['gx','gy','gz','|g|'], ['#1f77b4','#ff7f0e','#2ca02c','#000000']);
 
-def update_plot(frame):
-    global plotting_active
-    with buf_lock:
-        if len(t_buf) == 0:
-            return line_ax, line_ay, line_az, pred_text, conf_text
-        t = np.array(t_buf)
-        ax = np.array(ax_buf)
-        ay = np.array(ay_buf)
-        az = np.array(az_buf)
+    function pushPoint(chart, t, values){
+      values.forEach((v,i)=>{
+        const ds = chart.data.datasets[i];
+        ds.data.push({x: t, y: v});
+        if (ds.data.length > maxPoints) ds.data.shift();
+      });
+      chart.update('none');
+    }
 
-    # ventana móvil
-    t_last = float(t[-1])
-    t_min = max(0.0, t_last - WINDOW_SEC)
-    mask = t >= t_min
+    ws.onopen = () => {
+      console.log("WS conectado");
+      document.getElementById('info').innerText = "WS conectado a servidor.";
+    };
+    ws.onclose = () => {
+      console.log("WS desconectado");
+      document.getElementById('info').innerText = "WS desconectado.";
+    };
+    ws.onerror = (e) => console.warn("WS err", e);
 
-    if mask.any():
-        line_ax.set_data(t[mask], ax[mask])
-        line_ay.set_data(t[mask], ay[mask])
-        line_az.set_data(t[mask], az[mask])
-        ax1.set_xlim(t_min, t_last)
-        ax1.set_title(f"Tiempo: {t_last:.1f}s | Muestras: {len(t_buf)}")
-    else:
-        line_ax.set_data([], []); line_ay.set_data([], []); line_az.set_data([], [])
+    ws.onmessage = (ev) => {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg.type === 'sample') {
+          const t = msg.t;
+          pushPoint(accChart, t, [msg.ax, msg.ay, msg.az, msg.a_mag]);
+          pushPoint(gyroChart, t, [msg.gx, msg.gy, msg.gz, msg.g_mag]);
+        } else if (msg.type === 'pred') {
+          document.getElementById('pred').innerText = msg.best_label ? (msg.best_label.toUpperCase() + " (" + (msg.best_prob*100).toFixed(1) + "%)") : "N/D";
+          let html = "";
+          if (msg.topk){
+            msg.topk.forEach((p,i)=>{
+              html += `${i+1}) ${p[0]} — ${(p[1]*100).toFixed(1)}%<br/>`;
+            });
+          }
+          document.getElementById('topk').innerHTML = html;
+        } else if (msg.type === 'info'){
+          document.getElementById('info').innerText = msg.text;
+        }
+      } catch(e){
+        console.warn("Bad WS msg", e);
+      }
+    };
+  </script>
+</body>
+</html>
+"""
 
-    # predicción
-    lbl, prob, err = get_current_prediction_simple()
-    if err:
-        pred_text.set_text(err)
-        pred_text.set_color("gray")
-        conf_text.set_text("")
-    else:
-        pred_text.set_text(lbl.upper())
-        color = "green" if prob*100 > 70 else "orange" if prob*100 > 40 else "gray"
-        pred_text.set_color(color)
-        conf_text.set_text(f"{prob*100:.1f}% confianza")
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return HTMLResponse(INDEX_HTML)
 
-    return line_ax, line_ay, line_az, pred_text, conf_text
+# WebSocket endpoint
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket):
+    await ws.accept()
+    async with ws_lock:
+        ws_connections.add(ws)
+    try:
+        # send a small welcome/info
+        await ws.send_text(json.dumps({"type":"info","text":"Conectado al servidor"}))
+        while True:
+            # Keep connection alive waiting for client messages (we don't expect any)
+            try:
+                msg = await asyncio.wait_for(ws.receive_text(), timeout=30.0)
+                # ignore or could handle commands from client
+                await ws.send_text(json.dumps({"type":"info","text":"ok"}))
+            except asyncio.TimeoutError:
+                # ping periodically (no-op) to keep connection
+                await ws.send_text(json.dumps({"type":"info","text":"ping"}))
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        async with ws_lock:
+            if ws in ws_connections:
+                ws_connections.remove(ws)
 
-ani = FuncAnimation(fig, update_plot, interval=200, blit=False, cache_frame_data=False)
+# Background broadcaster : reads buffers and sends JSON to all websockets
+async def broadcaster_loop():
+    """Task started on app startup that periodically reads the latest sample
+    and prediction and broadcasts to all connected websockets."""
+    while not program_exit:
+        # snapshot latest sample
+        with buf_lock:
+            if len(t_buf) == 0:
+                sample = None
+            else:
+                sample = {
+                    "t": float(t_buf[-1]),
+                    "ax": float(ax_buf[-1]) if len(ax_buf)>0 else 0.0,
+                    "ay": float(ay_buf[-1]) if len(ay_buf)>0 else 0.0,
+                    "az": float(az_buf[-1]) if len(az_buf)>0 else 0.0,
+                    "gx": float(gx_buf[-1]) if len(gx_buf)>0 else 0.0,
+                    "gy": float(gy_buf[-1]) if len(gy_buf)>0 else 0.0,
+                    "gz": float(gz_buf[-1]) if len(gz_buf)>0 else 0.0,
+                }
+                sample["a_mag"] = (sample["ax"]**2 + sample["ay"]**2 + sample["az"]**2)**0.5
+                sample["g_mag"] = (sample["gx"]**2 + sample["gy"]**2 + sample["gz"]**2)**0.5
 
-# ===================== ENTRADA POR TECLADO (hilo) =====================
-def init_user_folder():
+        # send sample
+        if sample is not None:
+            msg = json.dumps({"type":"sample", **sample})
+            await _broadcast(msg)
+
+        # prediction (top1 + top3)
+        t0, top, err = predict_topk_now(k_top=3)
+        if err is None and top:
+            best_label, best_prob = top[0]
+            msgp = json.dumps({"type":"pred", "best_label":best_label, "best_prob":best_prob, "topk": top})
+        else:
+            msgp = json.dumps({"type":"pred", "best_label": None, "best_prob":0.0, "topk": []})
+        await _broadcast(msgp)
+
+        await asyncio.sleep(0.05)  # ~20 Hz update to clients
+
+async def _broadcast(text: str):
+    # send to all websocket connections (copy to avoid mutation while iterating)
+    async with ws_lock:
+        conns = list(ws_connections)
+    for ws in conns:
+        try:
+            await ws.send_text(text)
+        except Exception:
+            # drop broken connection
+            try:
+                async with ws_lock:
+                    if ws in ws_connections:
+                        ws_connections.remove(ws)
+            except Exception:
+                pass
+
+# FastAPI startup/shutdown events
+@app.on_event("startup")
+async def startup_event():
+    # start broadcaster task
+    asyncio.create_task(broadcaster_loop())
+    print("Web server: broadcaster started.")
+
+# ================ Threads to run BLE and optionally CSV ================
+def init_user_folder_interactive():
     try:
         user = input("Ingrese su nombre de usuario: ").strip()
     except EOFError:
@@ -394,61 +501,42 @@ def init_user_folder():
     csv_file_path = base_dir / f"{ts}.csv"
     return user, base_dir, csv_file_path
 
-def user_input_thread():
-    global is_logging, plotting_active, program_exit, diag_active, diag_thread, csv_file, csv_writer
-    print("Controles: 's' = empezar/reanudar, 'q' = pausar, 'd' = Top-3 cada 1s, 'x' = salir.\n")
-    while not program_exit:
-        try:
-            cmd = input().strip().lower()
-        except EOFError:
-            cmd = "x"
-        if cmd == "s":
-            if not plotting_active:
-                plotting_active = True
-                is_logging = True
-                start_plot_event.set()
-                print("▶️ REANUDADO: CSV + gráficas.")
-            else:
-                print("Ya estaba reproduciendo.")
-        elif cmd == "q":
-            if plotting_active or is_logging:
-                plotting_active = False
-                is_logging = False
-                try:
-                    if csv_file:
-                        csv_file.flush()
-                except Exception:
-                    pass
-                print("⏸️  PAUSA: sin cerrar ventanas.")
-            else:
-                print("Ya estaba en pausa.")
-        elif cmd == "d":
-            if diag_active:
-                diag_active = False
-                print("⏹️  Diagnóstico continuo OFF.")
-            else:
-                diag_active = True
-                if (diag_thread is None) or (not diag_thread.is_alive()):
-                    diag_thread = threading.Thread(target=diag_loop, daemon=True)
-                    diag_thread.start()
-                print("▶️  Diagnóstico continuo ON (Top-3 cada 1s).")
-        elif cmd == "x":
-            print("👋 Saliendo...")
-            program_exit_set()
-        else:
-            print("Comando no reconocido. Usa 's', 'q', 'd' o 'x'.")
+def start_ble_thread():
+    # run asyncio event loop for bleak in separate thread
+    def run():
+        asyncio.run(ble_main())
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    return t
 
-def program_exit_set():
-    global program_exit, diag_active
-    program_exit = True
-    diag_active = False
-    start_plot_event.set()  # en caso que plotter esté esperando
+def open_csv(csv_path):
+    global csv_file, csv_writer
+    try:
+        csv_file = open(csv_path, "w", newline="", encoding="utf-8")
+        import csv as _csv
+        csv_writer = _csv.writer(csv_file)
+        csv_writer.writerow(HEADERS)
+        csv_file.flush()
+        print("CSV opened:", csv_path)
+    except Exception as e:
+        print("CSV open failed:", e)
+        csv_file = None
+        csv_writer = None
 
-# ===================== MAIN =====================
+def close_csv():
+    global csv_file
+    try:
+        if csv_file:
+            csv_file.flush()
+            csv_file.close()
+    except Exception:
+        pass
+
+# --------------- main launcher ---------------
 def main():
-    global csv_file, csv_writer, csv_path, model_pipe, label_names, model_win_sec, model_hop_frac
+    global is_logging, program_exit, model_pipe, label_names, model_win_sec, model_hop_frac
 
-    # 1) Cargar modelo (si existe)
+    # load model if available
     if MODEL_PATH.exists():
         try:
             md = load(MODEL_PATH)
@@ -459,61 +547,30 @@ def main():
                 model_win_sec = float(cfg["win_sec"])
             if "hop_frac" in cfg:
                 model_hop_frac = float(cfg["hop_frac"])
-            print(f"Modelo cargado. Ventana={model_win_sec:.1f}s, hop={int(model_hop_frac*100)}%")
+            print(f"Modelo cargado. Ventana={model_win_sec:.1f}s hop={model_hop_frac:.2f}")
         except Exception as e:
-            print(f"⚠️ No pude cargar el modelo: {e}")
+            print("Model load error:", e)
             model_pipe = None
     else:
-        print("⚠️ NO se encontró modelo_multiclase.joblib → correrás solo gráficas.")
+        print("No se encontró modelo_multiclase.joblib — ejecutando solo gráficas.")
 
-    # 2) Carpeta usuario + CSV
-    print("=== SISTEMA DE RECEPCIÓN ===")
-    user_name, user_dir, csv_path = init_user_folder()
-    try:
-        csv_file = open(csv_path, "w", newline="", encoding="utf-8")
-        import csv as _csv
-        csv_writer = _csv.writer(csv_file)
-        csv_writer.writerow(HEADERS)
-        csv_file.flush()
-        print(f"CSV: {csv_path}")
-    except Exception as e:
-        csv_file = None
-        csv_writer = None
-        print(f"⚠️ No se pudo abrir CSV: {e}")
+    # init csv folder
+    print("=== SISTEMA DE RECEPCIÓN (web) ===")
+    user_name, user_dir, csv_path = init_user_folder_interactive()
+    open_csv(csv_path)
+    is_logging = True
 
-    # 3) Hilo plotter (usa FuncAnimation para actualizar)
-    t_plot = threading.Thread(target=_plt_show_thread, daemon=True)
-    t_plot.start()
+    # start BLE thread
+    start_ble_thread()
 
-    # 4) Hilo teclado
-    threading.Thread(target=user_input_thread, daemon=True).start()
+    # start uvicorn (this blocks)
+    print(f"Iniciando servidor en http://{HOST}:{PORT} ...")
+    uvicorn.run(app, host=HOST, port=PORT, log_level="info")
 
-    # 5) Hilo BLE (asyncio.run en hilo)
-    threading.Thread(target=lambda: asyncio.run(ble_main()), daemon=True).start()
-
-    # 6) loop principal: esperar salida
-    try:
-        while not program_exit:
-            time.sleep(0.2)
-    except KeyboardInterrupt:
-        program_exit_set()
-
-    # limpiar
-    print("Cerrando recursos...")
-    try:
-        if csv_file:
-            csv_file.flush()
-            csv_file.close()
-    except Exception:
-        pass
-    print("Listo. Adiós.")
-
-def _plt_show_thread():
-    """Thread separado para mostrar la ventana matplotlib.
-    Espera a que el usuario pulse 's' (start) para mostrar si se desea."""
-    start_plot_event.wait()
-    # Mostrar ventana de matplotlib (bloqueante)
-    plt.show()
+    # on exit
+    program_exit = True
+    close_csv()
+    print("Servidor detenido.")
 
 if __name__ == "__main__":
     main()
