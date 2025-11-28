@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="es">
+ <head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Monitor de Ejercicio</title>
+  <script src="/_sdk/element_sdk.js"></script>
+  <style>
+    body {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+    }
+
+    .container {
+      width: 100%;
+      height: 100%;
+      padding: 2.5%;
+      display: grid;
+      grid-template-columns: 45% 55%;
+      grid-template-rows: auto 1fr;
+      gap: 2%;
+    }
+
+    .header {
+      grid-column: 1 / -1;
+      background: rgba(255, 255, 255, 0.95);
+      border-radius: 16px;
+      padding: 1.5% 3%;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .exercise-info h1 {
+      margin: 0;
+      font-size: 2em;
+      color: #2d3748;
+      font-weight: 700;
+    }
+
+    .timer {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .timer-icon {
+      font-size: 1.8em;
+    }
+
+    .timer-value {
+      font-size: 2.2em;
+      font-weight: 700;
+      color: #667eea;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .left-panel {
+      display: flex;
+      flex-direction: column;
+      gap: 2%;
+    }
+
+    .movement-card {
+      background: rgba(255, 255, 255, 0.95);
+      border-radius: 16px;
+      padding: 5%;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .movement-visual {
+      width: 100%;
+      height: 70%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+    }
+
+    .exercise-avatar {
+      font-size: 12em;
+      animation: exerciseMove 2s ease-in-out infinite;
+    }
+
+    @keyframes exerciseMove {
+      0%, 100% { transform: translateY(0) scale(1); }
+      50% { transform: translateY(-20px) scale(1.05); }
+    }
+
+    .movement-label {
+      font-size: 1.5em;
+      font-weight: 600;
+      color: #2d3748;
+      margin-top: 5%;
+    }
+
+    .user-info-card {
+      background: rgba(255, 255, 255, 0.95);
+      border-radius: 16px;
+      padding: 4%;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 4%;
+      align-items: center;
+    }
+
+    .user-avatar {
+      font-size: 4em;
+    }
+
+    .user-details h3 {
+      margin: 0 0 8px 0;
+      font-size: 1.4em;
+      color: #2d3748;
+      font-weight: 600;
+    }
+
+    .user-stats {
+      display: flex;
+      gap: 20px;
+      font-size: 0.95em;
+      color: #4a5568;
+    }
+
+    .user-stat {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .right-panel {
+      background: rgba(255, 255, 255, 0.95);
+      border-radius: 16px;
+      padding: 3%;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+      display: flex;
+      flex-direction: column;
+      gap: 3%;
+      overflow-y: auto;
+    }
+
+    .stats-section h2 {
+      margin: 0 0 3% 0;
+      font-size: 1.4em;
+      color: #2d3748;
+      font-weight: 600;
+    }
+
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 3%;
+    }
+
+    .stat-card {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      border-radius: 12px;
+      padding: 5%;
+      color: white;
+      text-align: center;
+    }
+
+    .stat-value {
+      font-size: 2.2em;
+      font-weight: 700;
+      margin: 8px 0;
+    }
+
+    .stat-label {
+      font-size: 0.9em;
+      opacity: 0.9;
+    }
+
+    .chart-section {
+      margin-top: 4%;
+    }
+
+    .chart-container {
+      background: #f7fafc;
+      border-radius: 12px;
+      padding: 4%;
+      height: 180px;
+      position: relative;
+    }
+
+    .chart-bars {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-around;
+      height: 100%;
+      gap: 2%;
+    }
+
+    .chart-bar {
+      flex: 1;
+      background: linear-gradient(to top, #667eea, #764ba2);
+      border-radius: 6px 6px 0 0;
+      position: relative;
+      animation: barGrow 1s ease-out;
+      transition: all 0.3s ease;
+    }
+
+    .chart-bar:hover {
+      opacity: 0.8;
+      transform: translateY(-4px);
+    }
+
+    @keyframes barGrow {
+      from { height: 0; }
+    }
+
+    .chart-value {
+      position: absolute;
+      top: -25px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 0.75em;
+      font-weight: 600;
+      color: #2d3748;
+      white-space: nowrap;
+    }
+
+    .chart-labels {
+      display: flex;
+      justify-content: space-around;
+      margin-top: 8px;
+      font-size: 0.8em;
+      color: #718096;
+    }
+
+    .performance-indicator {
+      margin-top: 4%;
+      background: #f7fafc;
+      border-radius: 12px;
+      padding: 4%;
+    }
+
+    .performance-bar {
+      height: 12px;
+      background: #e2e8f0;
+      border-radius: 6px;
+      overflow: hidden;
+      margin: 12px 0;
+    }
+
+    .performance-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #48bb78, #38a169);
+      border-radius: 6px;
+      width: 78%;
+      animation: fillBar 1.5s ease-out;
+    }
+
+    @keyframes fillBar {
+      from { width: 0; }
+    }
+
+    .performance-text {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.85em;
+      color: #4a5568;
+    }
+
+    @media (max-width: 768px) {
+      .container {
+        grid-template-columns: 1fr;
+        grid-template-rows: auto auto 1fr;
+      }
+
+      .header {
+        flex-direction: column;
+        gap: 12px;
+        text-align: center;
+      }
+
+      .stats-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+  <style>@view-transition { navigation: auto; }</style>
+  <script src="/_sdk/data_sdk.js" type="text/javascript"></script>
+  <script src="https://cdn.tailwindcss.com" type="text/javascript"></script>
+ </head>
+ <body>
+  <div class="container">
+   <header class="header">
+    <div class="exercise-info">
+     <h1 id="exerciseTitle">Sentadillas con Peso</h1>
+    </div>
+    <div class="timer"><span class="timer-icon">⏱️</span> <span class="timer-value" id="timerDisplay">00:00</span>
+    </div>
+   </header>
+   <div class="left-panel">
+    <div class="movement-card">
+     <div class="movement-visual">
+        <div class="movement-visual">
+            <img id="exerciseGif" src="/static/gifs/descanso.gif" alt="Ejercicio" style="max-width:100%; max-height:100%; border-radius:16px; box-shadow:0 8px 32px rgba(0,0,0,0.3);">
+        </div>
+     </div>
+     <div class="movement-label">
+      En progreso
+     </div>
+    </div>
+    <div class="user-info-card">
+     <div class="user-avatar">
+      👤
+     </div>
+     <div class="user-details">
+      <h3 id="userName">María González</h3>
+      <div class="user-stats">
+       <div class="user-stat"><span>📅</span> <span id="userAge">28 años</span>
+       </div>
+       <div class="user-stat"><span>⚖️</span> <span id="userWeight">65 kg</span>
+       </div>
+       <div class="user-stat"><span>📏</span> <span>165 cm</span>
+       </div>
+      </div>
+     </div>
+    </div>
+   </div>
+   <div class="right-panel">
+    <section class="stats-section">
+     <h2>Estadísticas en Tiempo Real</h2>
+     <div class="stats-grid">
+      <div class="stat-card">
+       <div class="stat-label">
+        Repeticiones
+       </div>
+       <div class="stat-value" id="repsCount">
+        24
+       </div>
+      </div>
+      <div class="stat-card">
+       <div class="stat-label">
+        Calorías
+       </div>
+       <div class="stat-value" id="caloriesCount">
+        156
+       </div>
+      </div>
+      <div class="stat-card">
+       <div class="stat-label">
+        Ritmo Cardíaco
+       </div>
+       <div class="stat-value" id="heartRate">
+        142
+       </div>
+      </div>
+      <div class="stat-card">
+       <div class="stat-label">
+        Series
+       </div>
+       <div class="stat-value" id="setsCount">
+        3
+       </div>
+      </div>
+     </div>
+    </section>
+    <section class="chart-section">
+     <h2>Rendimiento por Serie</h2>
+     <div class="chart-container">
+      <div class="chart-bars">
+       <div class="chart-bar" style="height: 75%;"><span class="chart-value">12</span>
+       </div>
+       <div class="chart-bar" style="height: 85%;"><span class="chart-value">10</span>
+       </div>
+       <div class="chart-bar" style="height: 65%;"><span class="chart-value">8</span>
+       </div>
+       <div class="chart-bar" style="height: 55%;"><span class="chart-value">7</span>
+       </div>
+      </div>
+     </div>
+     <div class="chart-labels"><span>Serie 1</span> <span>Serie 2</span> <span>Serie 3</span> <span>Serie 4</span>
+     </div>
+    </section>
+    <section class="performance-indicator">
+     <h2>Rendimiento General</h2>
+     <div class="performance-bar">
+      <div class="performance-fill"></div>
+     </div>
+     <div class="performance-text"><span>Excelente desempeño</span> <span><strong>78%</strong></span>
+     </div>
+    </section>
+   </div>
+  </div>
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+<script>
+    const socket = io();
+
+    socket.on('update_exercise', (data) => {
+        document.getElementById('exerciseTitle').textContent = data.exercise;
+        document.getElementById('exerciseGif').src = data.gif + "?t=" + new Date().getTime();
+        document.getElementById('timerDisplay').textContent = data.timer;
+        document.getElementById('userName').textContent = data.user_name;
+
+        // Opcional: mostrar top 3 en consola o en algún div
+        console.log("Top-3:", data.top3);
+    });
+
+    // Inicia con valores por defecto
+    document.getElementById('userName').textContent = "María González";
+</script>
+ <script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'9a3a7968c719c14d',t:'MTc2NDAwMzc0OS4wMDAwMDA='};var a=document.createElement('script');a.nonce='';a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+</html>
